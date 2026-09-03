@@ -5,8 +5,11 @@ edition = "2024"
 description = "A Discord bot written in Rust using Serenity."
 
 [dependencies]
-serenity = { version = "0.12.5", features = ["client", "gateway", "rustls_backend", "model"] }
+serenity = { version = "0.12.5", features = ["client", "gateway", "rustls_backend", "cache", "model"] }
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+songbird = "0.6"
