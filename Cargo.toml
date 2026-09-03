@@ -2,6 +2,7 @@
 name = "dbot"
 version = "0.1.0"
 edition = "2024"
+description = "A Discord bot written in Rust using Serenity."
 
 [dependencies]
 serenity = { version = "0.12.5", features = ["client", "gateway", "rustls_backend", "model"] }
