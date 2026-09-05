@@ -7,9 +7,7 @@ use chrono::{
     DateTime,
     Duration as ChronoDuration,
     LocalResult,
-    NaiveDate,
     TimeZone,
-    Timelike,
     Utc,
 };
 use chrono_tz::Tz;
@@ -28,7 +26,10 @@ use serenity::{
     prelude::*,
 };
 
-use songbird::SerenityInit;
+use songbird::{
+    input::File,
+    SerenityInit,
+};
 use tokio::sync::RwLock;
 
 const NVIDIA_URL: &str =
@@ -51,7 +52,13 @@ const DEFAULT_SYSTEM_PROMPT: &str = concat!(
 type Memory =
     Arc<RwLock<HashMap<u64, VecDeque<ChatMessage>>>>;
 
-type SleepingUsers = Arc<RwLock<HashSet<(GuildId, UserId)>>>;
+
+type SleepingUsers =
+    Arc<RwLock<HashSet<(GuildId, UserId)>>>;
+
+
+type CurrentSound =
+    Arc<RwLock<HashMap<GuildId, songbird::tracks::TrackHandle>>>;
 
 #[derive(Clone, Debug)]
 pub struct SleepSchedule {
@@ -193,6 +200,7 @@ pub struct Bot {
     http: HttpClient,
     memory: Memory,
     sleeping_users: SleepingUsers,
+    current_sounds: CurrentSound,
 }
 
 impl Bot {
@@ -202,6 +210,7 @@ impl Bot {
             http: HttpClient::new(),
             memory: Arc::new(RwLock::new(HashMap::new())),
             sleeping_users: Arc::new(RwLock::new(HashSet::new())),
+            current_sounds: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -211,6 +220,7 @@ impl Bot {
             config: self.config.clone(),
             memory: self.memory,
             sleeping_users: self.sleeping_users,
+            current_sounds: self.current_sounds,
         };
 
         let intents = GatewayIntents::GUILDS
@@ -246,6 +256,8 @@ enum VoiceCommand {
     JoinUser(UserId),
     JoinChannel(ChannelId),
     Leave,
+    PlaySound(String),
+    StopSound,
 }
 
 struct Handler {
@@ -253,6 +265,7 @@ struct Handler {
     config: BotConfig,
     memory: Memory,
     sleeping_users: SleepingUsers,
+    current_sounds: CurrentSound,
 }
 
 #[async_trait]
@@ -359,12 +372,34 @@ impl EventHandler for Handler {
                 }
 
                 VoiceCommand::JoinAuthor => {
-                    self.handle_join_user(&ctx, &msg, msg.author.id).await;
+                    self.handle_join_user(
+                        &ctx,
+                        &msg,
+                        msg.author.id,
+                    )
+                    .await;
+
                     return;
                 }
 
                 VoiceCommand::Leave => {
                     self.handle_leave_command(&ctx, &msg).await;
+                    return;
+                }
+
+                VoiceCommand::PlaySound(sound) => {
+                    self.handle_play_sound(
+                        &ctx,
+                        &msg,
+                        &sound,
+                    )
+                    .await;
+
+                    return;
+                }
+
+                VoiceCommand::StopSound => {
+                    self.handle_stop_sound(&ctx, &msg).await;
                     return;
                 }
             }
@@ -704,6 +739,205 @@ impl Handler {
             }
         }
     }
+
+    async fn handle_play_sound(
+        &self,
+        ctx: &Context,
+        msg: &Message,
+        sound_name: &str,
+    ) {
+        let Some(guild_id) = msg.guild_id else {
+            let _ = msg
+                .channel_id
+                .say(&ctx.http, "This only works in a server.")
+                .await;
+
+            return;
+        };
+
+        let sounds_dir = std::path::Path::new("sounds");
+
+        if !sounds_dir.exists() {
+            let _ = msg
+                .channel_id
+                .say(&ctx.http, "My sounds folder doesn't exist.")
+                .await;
+
+            return;
+        }
+
+        let requested_name = sound_name
+            .trim()
+            .to_lowercase();
+
+        if requested_name.is_empty()
+            || requested_name.contains('/')
+            || requested_name.contains('\\')
+            || requested_name.contains("..")
+        {
+            let _ = msg
+                .channel_id
+                .say(&ctx.http, "Invalid sound name.")
+                .await;
+
+            return;
+        }
+
+        let mut sound_file = None;
+
+        let entries = match std::fs::read_dir(sounds_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("Failed to read sounds directory: {error}");
+
+                let _ = msg
+                    .channel_id
+                    .say(&ctx.http, "I couldn't read my sounds.")
+                    .await;
+
+                return;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            if !path.is_file() {
+                continue;
+            }
+
+            let Some(stem) = path.file_stem() else {
+                continue;
+            };
+
+            let Some(stem) = stem.to_str() else {
+                continue;
+            };
+
+            if stem.eq_ignore_ascii_case(&requested_name) {
+                sound_file = Some(path);
+                break;
+            }
+        }
+
+        let Some(sound_file) = sound_file else {
+            let _ = msg
+                .channel_id
+                .say(
+                    &ctx.http,
+                    format!(
+                        "I don't have a sound called `{}`.",
+                        requested_name
+                    ),
+                )
+                .await;
+
+            return;
+        };
+
+        let manager = songbird::get(ctx)
+            .await
+            .expect("Songbird Voice client was not initialized")
+            .clone();
+
+        let Some(call_lock) = manager.get(guild_id) else {
+            let _ = msg
+                .channel_id
+                .say(
+                    &ctx.http,
+                    "I'm not in a voice channel.",
+                )
+                .await;
+
+            return;
+        };
+
+        {
+            let mut sounds = self.current_sounds.write().await;
+
+            if let Some(previous) = sounds.remove(&guild_id) {
+                let _ = previous.stop();
+            }
+        }
+
+        let track = {
+            let mut call = call_lock.lock().await;
+
+            call.play_input(
+                songbird::input::File::new(sound_file).into()
+            )
+        };
+
+        {
+            let mut sounds = self.current_sounds.write().await;
+            sounds.insert(guild_id, track);
+        }
+
+        let _ = msg
+            .channel_id
+            .say(
+                &ctx.http,
+                format!(
+                    "Playing `{}`.",
+                    requested_name
+                ),
+            )
+            .await;
+    }
+
+    async fn handle_stop_sound(
+        &self,
+        ctx: &Context,
+        msg: &Message,
+    ) {
+        let Some(guild_id) = msg.guild_id else {
+            return;
+        };
+
+        let mut sounds = self.current_sounds.write().await;
+
+        match sounds.remove(&guild_id) {
+            Some(track) => {
+                match track.stop() {
+                    Ok(_) => {
+                        let _ = msg
+                            .channel_id
+                            .say(
+                                &ctx.http,
+                                "Stopped.",
+                            )
+                            .await;
+                    }
+
+                    Err(error) => {
+                        eprintln!(
+                            "Failed to stop sound in {}: {}",
+                            guild_id,
+                            error
+                        );
+
+                        let _ = msg
+                            .channel_id
+                            .say(
+                                &ctx.http,
+                                "I couldn't stop the sound.",
+                            )
+                            .await;
+                    }
+                }
+            }
+
+            None => {
+                let _ = msg
+                    .channel_id
+                    .say(
+                        &ctx.http,
+                        "Nothing is playing.",
+                    )
+                    .await;
+            }
+        }
+    }
 }
 
 async fn run_sleep_scheduler(
@@ -839,25 +1073,41 @@ fn parse_voice_command(
         "",
     );
 
-    let command = content.trim().to_lowercase();
+    let command = content.trim();
 
-    if command == "join"
-        || command == "come"
-        || command == "komm"
+    let lower = command.to_lowercase();
+
+    if lower == "join"
+        || lower == "come"
+        || lower == "komm"
     {
         return Some(VoiceCommand::JoinAuthor);
     }
 
-    if command == "leave"
-        || command == "disconnect"
-        || command == "go away"
+    if lower == "leave"
+        || lower == "disconnect"
+        || lower == "go away"
     {
         return Some(VoiceCommand::Leave);
     }
 
-    if command.starts_with("join ")
-        || command.starts_with("come ")
-        || command.starts_with("komm ")
+    if lower == "stop" {
+        return Some(VoiceCommand::StopSound);
+    }
+
+    if let Some(sound) = command.strip_prefix("sound ")
+        .or_else(|| command.strip_prefix("play "))
+    {
+        let sound = sound.trim().to_lowercase();
+
+        if !sound.is_empty() {
+            return Some(VoiceCommand::PlaySound(sound));
+        }
+    }
+
+    if lower.starts_with("join ")
+        || lower.starts_with("come ")
+        || lower.starts_with("komm ")
     {
         if let Some(user) = msg
             .mentions

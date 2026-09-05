@@ -22,7 +22,7 @@ async fn main() {
     let sleep = SleepSchedule::daily(
         GuildId::new(1206341039548403764),
         UserId::new(893892818068725780),
-        22,
+        24,
         00,
         Madrid,
     )
